@@ -1,0 +1,580 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+#
+# Copyright 2018 Nicolas Thauvin. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHORS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+from __future__ import print_function
+import argparse
+import sys
+import os
+import paramiko
+import re
+import logging
+import getpass
+import socket
+
+__version__ = "0.0.1"
+
+logger = logging.getLogger(__name__)
+
+
+class KeyexException(Exception):
+    """
+    Exception raised by failures in Key Exchange
+    """
+
+    pass
+
+
+class KeyexTarget(object):
+    """
+    Class wrapping an ssh access to user@host
+    used to create ssh keys and get them
+    """
+
+    def __init__(
+        self, target, jump=None, allow_missing_host_keys=False
+    ):
+        # target is the literal string [user@]host where to create an exchange
+        # SSH Key
+        self.target = target
+
+        # jump is [user@]host to use to reach target
+        self.jump = jump
+        if jump is not None and not len(jump):
+            self.jump = None
+
+        # Prepare target and jump
+        self.user, self.host = self.parse_target(target)
+        if self.jump is not None:
+            self.jump_user, self.jump_host = self.parse_target(jump)
+        else:
+            self.jump_user, self.jump_host = None, None
+
+        # When connecting to the jump host, user becomes the target user. we
+        # will never use a value from ssh_config so we default to the local
+        # user.
+        if self.jump_host is not None and self.user is None:
+            self.user = getpass.getuser()
+
+        # paramiko client
+        self.ssh = paramiko.SSHClient()
+        self.ssh.load_system_host_keys()
+        if allow_missing_host_keys:
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.connected = False
+
+        # cache the public key
+        self.public_key = None
+
+        # utilities
+        self._keytypes = [
+            'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384',
+            'ecdsa-sha2-nistp521', 'ssh-ed25519', 'ssh-dss', 'ssh-rsa'
+            ]
+
+    def parse_target(self, t):
+        try:
+            parts = t.split('@')
+
+        except AttributeError:
+            logger.error("could not parse target host")
+            raise
+
+        if len(parts) == 1:
+            if not len(parts[0]):
+                raise KeyexException("Invalid hostname")
+            else:
+                # user was not provided
+                return [None, parts[0]]
+        else:
+            if not len(parts[0]):
+                raise KeyexException("Invalid username")
+            elif not len(parts[1]):
+                raise KeyexException("Invalid hostname")
+            else:
+                # user and host provided but we limit the result to two values
+                return [parts[0], parts[1]]
+
+    def __repr__(self):
+        if self.jump is not None:
+            return '{} via {}'.format(
+                self.target, self.jump
+                )
+        else:
+            return '{}'.format(
+                self.target
+                )
+
+    def __str__(self):
+        return "{}@{}".format(self.user, self.host)
+
+    def __eq__(self, other):
+        if self.user == other.user and self.host == other.host:
+            return True
+        else:
+            return False
+
+    def connect(self):
+        """Connect to the target using ssh using the jump host if provided
+        """
+
+        logging.debug("Connecting to {}".format(repr(self)))
+
+        # Prepare the configuration to give to paramiko
+        config = dict()
+        if self.jump_host is not None:
+            config['hostname'] = self.jump_host
+            config['username'] = self.jump_user
+        else:
+            config['hostname'] = self.host
+            config['username'] = self.user
+
+        # Parse the ssh client config to get the real hostname, user and pubkey
+        # paths
+        ssh_config = paramiko.SSHConfig()
+        for conf in (
+                "/etc/ssh/ssh_config",
+                os.path.expanduser("~/.ssh/config")
+                ):
+            try:
+                with open(conf) as fd:
+                    ssh_config.parse(fd)
+            except Exception as e:
+                logger.debug("configuration not readable: {} ({})".format(
+                    conf, str(e)
+                    ))
+
+        raw_config = ssh_config.lookup(config['hostname'])
+
+        # When the connection user is not given on commandline but found in the
+        # config use it, this let the commandline overwrite the config
+        if config['username'] is None:
+            if 'user' in raw_config:
+                config['username'] = raw_config['user']
+            else:
+                config['username'] = getpass.getuser()
+
+        # From here we know who is the remote user, we save it to check if we
+        # need to use sudo
+        self.remote_user = config['username']
+
+        for param in ('hostname', 'port'):
+            if param in raw_config:
+                config[param] = raw_config[param]
+
+        # Non-default public keys
+        if 'identityfile' in raw_config:
+            config['key_filename'] = raw_config['identityfile']
+
+        for a in range(3):
+            try:
+                # setup proxycommand. Since it opens a subprocess, we do it
+                # along side the connect() call so that we can reopen it if we
+                # need to retry to connection attempt in case of a bad password
+                if 'proxycommand' in raw_config:
+                    config['sock'] = paramiko.ProxyCommand(
+                        raw_config['proxycommand']
+                        )
+
+                self.ssh.connect(**config)
+            except paramiko.BadHostKeyException:
+                logger.error("Unable to validate host key")
+                raise
+            except paramiko.AuthenticationException:
+                # ask a password and try to reconnect
+                if a > 0:
+                    logger.error("Permission denied, please try again")
+                config['password'] = getpass.getpass(
+                    'Password for {}@{}: '.format(
+                        config['username'], config['hostname']
+                        )
+                    )
+                self.ssh.close()
+                if a >= 2:
+                    raise KeyexException("Too many authentication failures")
+                else:
+                    continue
+            except paramiko.SSHException as e:
+                raise KeyexException("{}: {}", format(repr(self), e))
+            except socket.gaierror as e:
+                raise KeyexException("{}: {}".format(repr(self), e))
+            break
+
+        self.connected = True
+
+    def close(self):
+        self.ssh.close()
+        self.connected = False
+
+    def exec_command(self, command):
+        """execute a command with support for sudo"""
+        if not self.connected:
+            raise KeyexException("Cannot run an command when not connected")
+
+        sudo = ''
+        if (
+            self.remote_user != self.user
+            and self.remote_user != 'root'
+        ):
+            sudo = "sudo -u {user} ".format(user=self.user)
+
+        logger.debug("Command: {}".format(sudo + command))
+        return self.ssh.exec_command(sudo + command)
+
+    def run_command(self, command):
+        """execute a command a return the contents of stdout"""
+        stdin, stdout, stderr = self.exec_command(command)
+        rc = stdout.channel.recv_exit_status()
+        if rc:
+            logger.debug("Command execution failed: rc={}".format(rc))
+            logger.debug("stderr:")
+            for l in stderr:
+                logger.debug(l.rstrip())
+            raise KeyexException("command execution failed: rc={}".format(rc))
+        else:
+            logger.debug("Command execution successful")
+        return [l.rstrip() for l in stdout.readlines()]
+
+    def get_pubkey(self, kind=None):
+        """
+        Get the public key of the user if it exists
+        """
+
+        if self.public_key is not None:
+            return self.public_key
+
+        candidates = [
+            'id_dsa.pub',
+            'id_ecdsa.pub',
+            'id_ed25519.pub',
+            'id_rsa.pub'
+            ]
+        if kind is not None:
+            wanted = 'id_{}.pub'.format(kind)
+            if wanted in candidates:
+                candidates = [wanted]
+
+        try:
+            contents = self.run_command("ls ~{user}/.ssh/".format(
+                user=self.user
+                ))
+        except KeyexException:
+            return None
+
+        pubkey_file = None
+        for line in contents:
+            if line in candidates:
+                pubkey_file = "~{user}/.ssh/{file}".format(
+                    user=self.user,
+                    file=line.rstrip()
+                    )
+                logger.debug("Found {}".format(pubkey_file))
+                break
+
+        try:
+            contents = self.run_command("cat {file}".format(
+                file=pubkey_file
+                ))
+        except KeyexException:
+            return None
+
+        self.public_key = contents[0]
+        return self.public_key
+
+    def keygen(self, kind="rsa"):
+        algos = ['dsa', 'ecdsa', 'ed25519', 'rsa']
+        if kind not in algos:
+            raise KeyexException("unsupported algorithm for keygen")
+
+        try:
+            self.run_command(
+                "ssh-keygen -q -N '' -t {algo} "
+                "-f ~{user}/.ssh/id_{algo}".format(
+                    algo=kind,
+                    user=self.user
+                    )
+                )
+        except KeyexException:
+            raise KeyexException("Could not execute ssh-keygen")
+
+        return self.get_pubkey(kind)
+
+    def authorize_key(self, key):
+        """
+        writes a key or a list of keys to authorized_keys avoiding duplicates
+        """
+
+        if key is None:
+            logger.debug("authorize_keys called without any key")
+            return
+        elif isinstance(key, list):
+            keys = key
+        else:
+            keys = [key]
+
+        # Since we may need to sudo to read the file, just use cat
+        authorized_keys = []
+        try:
+            for entry in self.run_command(
+                    "cat ~{user}/.ssh/authorized_keys".format(user=self.user)
+                    ):
+                n = self._parse_pubkey_entry(entry)
+                if n is not None:
+                    authorized_keys.append(n)
+        except KeyexException as e:
+            pass
+
+        new_entries = []
+        for candidate in keys:
+            candidate_entry = self._parse_pubkey_entry(candidate)
+            add_key = True
+            for entry in authorized_keys:
+                if (
+                    entry['keytype'] == candidate_entry['keytype']
+                    and entry['key'] == candidate_entry['key']
+                ):
+                    # do not overwrite current options and print a warning
+                    if entry['options'] is not None:
+                        logger.warning(
+                            "key already in authorized_keys with options"
+                            )
+                    add_key = False
+            if add_key:
+                new_entries.append(candidate)
+
+        if len(new_entries):
+            # Add the new keys circling around possible issues with permissions
+            # when sudo is needed
+            stdin, stdout, stderr = self.exec_command(
+                "sh -c 'cat >> ~{user}/.ssh/authorized_keys'".format(
+                    user=self.user
+                    )
+                )
+            for e in new_entries:
+                stdin.write("{}\n".format(e))
+            stdin.channel.shutdown_write()
+            if stdout.channel.recv_exit_status():
+                raise KeyexException(
+                    "Unable to append key to authorized_keys file"
+                    )
+
+    def _parse_pubkey_entry(self, entry):
+        ake = re.compile(
+            r'^(?:(?P<options>.*)\s+)?(?P<keytype>'
+            + r'|'.join(self._keytypes)
+            + r')\s+(?P<key>\S+)(?:\s+(?P<comment>.*))?$'
+            )
+
+        m = ake.search(entry)
+        if m is None:
+            return None
+        return {x: m.group(x) for x in [
+            'options', 'keytype', 'key', 'comment'
+            ]}
+
+    def get_hostpubkey(self):
+        for kind in ['ecdsa', 'rsa']:
+            try:
+                contents = self.run_command(
+                    "cat /etc/ssh/ssh_host_{}_key.pub".format(kind)
+                    )
+            except KeyexException:
+                pass
+            return contents[0]
+
+    def know_host(self, hostname, key):
+        """
+        writes a key or a list of keys to know_hosts avoiding duplicates
+        """
+
+        if key is None or hostname is None:
+            logger.debug("know_host called without hostname or key")
+            return
+
+        # Since the hostname can be hashed inside known_hosts, use ssh-keygen
+        # to verify if the hostname is already known
+        stdin, stdout, stderr = self.exec_command(
+            "ssh-keygen -F '{host}'".format(host=hostname)
+            )
+
+        if stdout.channel.recv_exit_status() == 0:
+            return
+
+        entry = self._parse_pubkey_entry(key)
+        if entry is None:
+            raise KeyexException("Unable to parse public key")
+
+        # Add the key. XXX rehash ?
+        stdin, stdout, stderr = self.exec_command(
+            "sh -c 'cat >> ~{user}/.ssh/known_hosts'".format(user=self.user)
+            )
+        stdin.write("{host} {keytype} {key}\n".format(
+            host=hostname,
+            keytype=entry['keytype'],
+            key=entry['key']
+            ))
+        stdin.channel.shutdown_write()
+        if stdout.channel.recv_exit_status():
+            raise KeyexException("Unable to append key to known_hosts file")
+
+
+def parse_cli():
+    parser = argparse.ArgumentParser(
+        description="SSH Key Exchanger",
+        usage='%(prog)s [options] [user@]host [[user@]host ...]'
+        )
+    parser.add_argument(
+        'targets', metavar='[user@]host', nargs='*',
+        help='list of target hosts where to create and exchange keys'
+        )
+    parser.add_argument(
+        '--include-self', action='store_true', default=False,
+        help='allow key exchange on the same host'
+        )
+    parser.add_argument(
+        '--from-first-host', action='store_true', default=False,
+        help='exchange keys between only the first host of the list on the '
+        'next ones'
+        )
+    parser.add_argument(
+        '--one-way', action='store_true', default=False,
+        help='when exchanging keys from the first host only, do not exchange '
+        'back keys from the other hosts to the first one'
+        )
+    parser.add_argument(
+         '--connect-to', dest='jump', metavar='HOSTS',
+         help='comma separated list of hosts to connect to instead of the '
+         'targets. Each member replace the target at the same position in the '
+         'list'
+         )
+    parser.add_argument(
+        '--allow-missing-host-keys', action='store_true',
+        default=False, help='accept host key not found in known_hosts file'
+        )
+    parser.add_argument(
+        '--debug', action='store_true', default=False,
+        help='debug mode'
+        )
+    parser.add_argument(
+        '--version', '-V', action='store_true',
+        default=False, help='show version and exit'
+        )
+    args = parser.parse_args()
+
+    # Take care of the version information immediately
+    if args.version:
+        print("keyex version {}".format(__version__))
+        sys.exit(0)
+
+    return args
+
+
+def main():
+    logging.basicConfig(format="%(levelname)s: %(message)s")
+    args = parse_cli()
+
+    if len(args.targets) < 2:
+        logger.error("At least two hosts required")
+        sys.exit(1)
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
+    # Prepare the jump host list, it must be the same length as the target list
+    if args.jump is not None:
+        jump_hosts = args.jump.split(',')
+    else:
+        jump_hosts = []
+
+    for i in range(len(jump_hosts), len(args.targets)):
+        jump_hosts.append(None)
+
+    rc = 0
+    # Connect to the hosts
+    hosts = []
+    for i in range(len(args.targets)):
+        try:
+            t = KeyexTarget(
+                args.targets[i],
+                jump_hosts[i],
+                args.allow_missing_host_keys
+                )
+            logger.info("Connecting to {}".format(repr(t)))
+            t.connect()
+        except KeyexException as e:
+            logger.error("{}".format(e))
+            rc = 2
+            continue
+        hosts.append(t)
+
+    # Exchange keys
+    for src in hosts:
+        src_pubkey = src.get_pubkey()
+        if src_pubkey is None:
+            src_pubkey = src.keygen()
+
+        src_host_pubkey = src.get_hostpubkey()
+
+        for dst in hosts:
+            if not args.include_self and src == dst:
+                continue
+
+            logger.info("Sending public key of {} to {}".format(
+                src, dst
+                ))
+
+            dst.authorize_key(src_pubkey)
+
+            if src_host_pubkey is not None:
+                dst.know_host(src.host, src_host_pubkey)
+
+            # When exchanging from the first host only, exchange back
+            # explicitly since we break the outer loop
+            if args.from_first_host and not args.one_way:
+                logger.info("Sending public key of {} to {}".format(
+                    dst, src
+                ))
+
+                dst_pubkey = dst.get_pubkey()
+                if dst_pubkey is None:
+                    dst_pubkey = dst.keygen()
+                src.authorize_key(dst_pubkey)
+
+                dst_host_pubkey = dst.get_hostpubkey()
+                if dst_host_pubkey is not None:
+                    src.know_host(dst.host, dst_host_pubkey)
+
+        if args.from_first_host:
+            break
+
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
