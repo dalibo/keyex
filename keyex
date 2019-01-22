@@ -336,6 +336,16 @@ class KeyexTarget(object):
         else:
             keys = [key]
 
+        # Init ~user/.ssh and authorized_keys if needed
+        self.run_command("mkdir -p ~{user}/.ssh/".format(
+                            user=self.user))
+        self.run_command("chmod 0700 ~{user}/.ssh/".format(
+                            user=self.user))
+        self.run_command("touch ~{user}/.ssh/authorized_keys".format(
+                            user=self.user))
+        self.run_command("chmod 0600 ~{user}/.ssh/authorized_keys".format(
+                            user=self.user))
+
         # Since we may need to sudo to read the file, just use cat
         authorized_keys = []
         try:
